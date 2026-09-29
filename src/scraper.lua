@@ -4,6 +4,8 @@ local Config_ok, Config = pcall(require, "annas.config")
 if not Config_ok then Config = nil end
 local Api_ok, Api = pcall(require, "annas.api")
 if not Api_ok then Api = nil end
+local FlareSolverr_ok, FlareSolverr = pcall(require, "annas.flaresolverr")
+if not FlareSolverr_ok then FlareSolverr = nil end
 
 -- Cache configuration
 local CACHE_FILE = "annas_domains_cache.txt"
@@ -136,6 +138,20 @@ local function get_annas_archive_domains()
     return fetch_domains_from_wikipedia() or {}
 end
 
+-- A page to ask FlareSolverr for when the user runs the connection test in
+-- Settings. Any current Anna's Archive mirror is the right thing to probe: it
+-- is the one site whose protection actually gets in the plugin's way, so a
+-- successful fetch here means the setup will work in practice. Falls back to
+-- the Wikipedia page the mirror list itself comes from, which at least proves
+-- the service can load something.
+function get_annas_archive_probe_url()
+    local domains = get_annas_archive_domains()
+    if #domains == 0 then
+        return "https://en.wikipedia.org/wiki/Anna%27s_Archive"
+    end
+    return "https://" .. domains[1] .. "/"
+end
+
 
 local function extract_md5_and_link(line)
     -- Extract MD5 hash from href="/md5/<hash>" pattern
@@ -206,6 +222,91 @@ local function extract_description(line)
     end
     print("Description: Could not retrieve")
     return 'Could not retrieve description.'
+end
+
+-- Parse one Anna's Archive search results page into a list of books.
+-- Returns the list plus the number of entries found. Kept separate from the
+-- fetch/mirror-retry logic so a page fetched again through FlareSolverr can be
+-- run through exactly the same parsing.
+local function parse_annas_results(data, annas_url)
+    -- Split HTML into book entries using consistent pattern
+    local split_pattern = 'pt-3 pb-3 border-b last:border-b-0 border-gray-100'
+
+    local result_html = split_pattern .. data
+    local segments = {}
+
+    local start_pos = 1
+
+    while true do
+        local s, e = result_html:find(split_pattern, start_pos, true)
+        if not s then break end
+
+        -- Find next occurrence to extract individual segments
+        local next_s = result_html:find(split_pattern, e + 1, true)
+
+        local segment
+        if next_s then
+            segment = result_html:sub(s, next_s - 1)
+            start_pos = next_s
+        else
+            segment = result_html:sub(s)
+            start_pos = #result_html + 1
+        end
+
+        table.insert(segments, segment)
+    end
+
+    local book_lst = {}
+    local book_count = 0
+
+    for i, entry in ipairs(segments) do
+        print("\n---- Entry #" .. i .. " ----\n")
+        print(string.sub(entry, 1, 100))
+
+        local md5 = extract_md5_and_link(entry)
+        local link = nil
+
+        if md5 then
+            link = annas_url .. 'md5/' .. md5
+            print('found link', link )
+        else
+            print('Couldnt fetch MD5 sum of entry, probs not a valid html segment.')
+            goto continue
+        end
+
+        local book = {}
+        book.title = extract_title(entry)
+        book.author = extract_author(entry)
+        book.format = extract_format(entry)
+        book.description = extract_description(entry)
+        book.md5 = md5
+        book.link = link
+
+        local has_lgli = string.find(entry, "lgli", 1, true) ~= nil
+        local has_zlib = string.find(entry, "zlib", 1, true) ~= nil
+        if has_lgli and has_zlib then
+            book.download = 'lgli | zlib'
+        elseif has_lgli then
+            book.download = 'lgli'
+        elseif has_zlib then
+            book.download = 'zlib'
+        end
+
+        local number_str = entry:match(" (%d+%.?%d*)MB · ")
+        if number_str then
+            book.size = number_str .. "MB"
+        end
+
+        print(book.download)
+
+        table.insert(book_lst, book)
+        book_count = book_count + 1
+
+        ::continue::
+    end
+
+    print("found " .. book_count .. " entries")
+    return book_lst, book_count
 end
 
 -- Check if external command (curl/wget) is available
@@ -285,6 +386,41 @@ local function best_reason(a, b)
         return b
     end
     return a
+end
+
+-- An anti-bot interstitial is usually served as a perfectly ordinary HTTP 200,
+-- so a fetch that "succeeded" tells us nothing on its own about whether the
+-- body is real content. These are the markers the pages we hit actually carry:
+-- Anna's Archive sits behind DDoS-Guard, libgen and Wikipedia's mirrors can
+-- sit behind Cloudflare. check_url() uses this to decide a body is a challenge
+-- worth re-requesting through FlareSolverr.
+local CHALLENGE_MARKERS = {
+    "DDoS-Guard",
+    "/.well-known/ddos-guard/",
+    "Just a moment...",
+    "Checking your browser before accessing",
+    "cf-browser-verification",
+    "cf_chl_opt",
+    "__cf_chl_",
+    "/cdn-cgi/challenge-platform/",
+    "Attention Required! | Cloudflare",
+    "Enable JavaScript and cookies to continue",
+}
+
+local function looks_like_challenge(html)
+    if not html or html == "" then
+        return true
+    end
+    for _, marker in ipairs(CHALLENGE_MARKERS) do
+        if html:find(marker, 1, true) then
+            return true
+        end
+    end
+    -- Generic server/gateway error pages (e.g. nginx's "502 Bad Gateway"),
+    -- whether or not the fetch tier that served them already checked the
+    -- status code itself.
+    local http_error_code = html:match("<title>%s*(%d%d%d)%s+[^<]*</title>")
+    return http_error_code ~= nil and tonumber(http_error_code) >= 400
 end
 
 -- Pure Lua HTTP implementation using LuaSocket (fallback method)
@@ -482,16 +618,73 @@ local function fetch_with_api(url)
     return "api_failed", nil, reason or "unreachable"
 end
 
--- Main HTTP request function with three-tier fallback system
-function check_url(url)
+-- Main HTTP request function: direct fetch tiers first, FlareSolverr on top of
+-- them when it is configured
+--
+-- options.allow_solver  - set to false for binary downloads: FlareSolverr
+--                         returns the page as a JSON string, which would
+--                         corrupt the book bytes (default: true)
+-- options.is_blocked    - optional function(html) -> boolean, letting a caller
+--                         with stronger knowledge of what a valid page looks
+--                         like supply its own challenge detection
+--                         (default: looks_like_challenge)
+--
+-- When FlareSolverr is configured, "always" mode tries it before everything
+-- else, and "fallback" mode (the default) reaches for it once a direct fetch
+-- has failed or come back as a challenge page. Either way at most one
+-- FlareSolverr request is made per call, and a FlareSolverr failure is never
+-- fatal - the direct tiers still get their turn.
+function check_url(url, options)
     print('=== DEBUG: check_url called with:', url)
 
+    options = options or {}
+    local allow_solver = options.allow_solver ~= false
+    local is_blocked = options.is_blocked or looks_like_challenge
+    local solver_mode = FlareSolverr and FlareSolverr.getMode() or nil
+    local solver_tried = false
     local reason = nil
+
+    local function can_solve()
+        return allow_solver and solver_mode ~= nil and not solver_tried
+    end
+
+    local function solve(note)
+        solver_tried = true
+        print('=== Trying FlareSolverr (' .. note .. ') for URL:', url)
+        local solver_status, solver_data, solver_reason = FlareSolverr.fetch(url)
+        if solver_status == "success" then
+            return "success", solver_data
+        end
+        reason = best_reason(reason, solver_reason)
+        return nil
+    end
+
+    if solver_mode == FlareSolverr.MODE_ALWAYS then
+        local solver_status, solver_data = solve("always mode")
+        if solver_status then
+            return "success", solver_data
+        end
+        print('=== FlareSolverr did not return the page, falling back to direct requests')
+    end
+
+    -- A body that passed a direct fetch but reads as a challenge page is worth
+    -- exactly one more try through the browser-based solver.
+    local function accept_body(data)
+        if can_solve() and is_blocked(data) then
+            print('=== Response looks like an anti-bot challenge, retrying through FlareSolverr')
+            local solver_status, solver_data = solve("challenge page")
+            if solver_status then
+                return "success", solver_data
+            end
+            print('=== FlareSolverr did not return usable content, keeping the original response')
+        end
+        return "success", data
+    end
 
     -- Method 1: Try external commands (curl/wget) - most reliable
     local ext_status, ext_data, ext_reason = fetch_with_external_command(url)
     if ext_status == "success" then
-        return "success", ext_data
+        return accept_body(ext_data)
     end
     reason = best_reason(reason, ext_reason)
 
@@ -500,7 +693,7 @@ function check_url(url)
     -- Method 2: Try LuaSocket (pure Lua, no external dependencies)
     local socket_status, socket_data, socket_reason = fetch_with_lua_socket(url)
     if socket_status == "success" then
-        return "success", socket_data
+        return accept_body(socket_data)
     end
     reason = best_reason(reason, socket_reason)
 
@@ -509,15 +702,37 @@ function check_url(url)
     -- Method 3: Try KOReader's API with multiple configurations
     local api_status, api_data, api_reason = fetch_with_api(url)
     if api_status == "success" then
-        return "success", api_data
+        return accept_body(api_data)
     end
     reason = best_reason(reason, api_reason)
 
+    -- Method 4: last resort, let FlareSolverr have a go before giving up
+    if can_solve() then
+        local solver_status, solver_data = solve("all direct fetches failed")
+        if solver_status then
+            return "success", solver_data
+        end
+    end
+
     -- All methods failed
     print('=== ERROR: All HTTP methods failed')
-    print('=== Tried: external commands (curl/wget), LuaSocket, Api.makeHttpRequest')
+    print('=== Tried: external commands (curl/wget), LuaSocket, Api.makeHttpRequest'
+        .. (solver_tried and ', FlareSolverr' or ''))
 
     return "network_error", nil, reason or "unreachable"
+end
+
+-- Fetch a page straight through FlareSolverr, bypassing check_url's tier
+-- order. Used where a challenge is only recognisable after parsing, which is
+-- too late for check_url to act on itself. Returns the same
+-- status/data/reason triple as check_url, or nil when FlareSolverr isn't
+-- configured for this call.
+local function fetch_with_flaresolverr(url)
+    if not FlareSolverr or not FlareSolverr.isConfigured() then
+        return nil
+    end
+    local solver_status, solver_data, solver_reason = FlareSolverr.fetch(url)
+    return solver_status, solver_data, solver_reason
 end
 
 -- Turn a tally of per-mirror failure reasons into a message that actually
@@ -686,87 +901,29 @@ local function annas_search(query)
             goto retry
         end
 
-        -- Split HTML into book entries using consistent pattern
-        local split_pattern = 'pt-3 pb-3 border-b last:border-b-0 border-gray-100'
-        
-        result_html = split_pattern .. data
-        
-        segments = {}
-        
-        local start_pos = 1
-        
-        while true do
-            local s, e = result_html:find(split_pattern, start_pos, true)
-            if not s then break end
-            
-            -- Find next occurrence to extract individual segments
-            local next_s = result_html:find(split_pattern, e + 1, true)
-            
-            local segment
-            if next_s then
-                segment = result_html:sub(s, next_s - 1)
-                start_pos = next_s
-            else
-                segment = result_html:sub(s)
-                start_pos = #result_html + 1
-            end
-            
-            table.insert(segments, segment)
-        end
-
-        local book_lst = {}
-        book_count = 0 
-
-        for i, entry in ipairs(segments) do
-            print("\n---- Entry #" .. i .. " ----\n")
-            print(string.sub(entry, 1, 100))
-
-            local md5 = extract_md5_and_link(entry)
-            local link = nil
-            
-            if md5 then
-                link = annas_url .. 'md5/' .. md5
-                print('found link', link )
-            else
-                print('Couldnt fetch MD5 sum of entry, probs not a valid html segment.')
-                goto continue
-            end
-
-            local book = {}
-            book.title = extract_title(entry)
-            book.author = extract_author(entry)
-            book.format = extract_format(entry)
-            book.description = extract_description(entry)
-            book.md5 = md5
-            book.link = link
-            
-            local has_lgli = string.find(entry, "lgli", 1, true) ~= nil
-            local has_zlib = string.find(entry, "zlib", 1, true) ~= nil
-            if has_lgli and has_zlib then
-                book.download = 'lgli | zlib'
-            elseif has_lgli then
-                book.download = 'lgli'
-            elseif has_zlib then
-                book.download = 'zlib'
-            end
-
-            local number_str = entry:match(" (%d+%.?%d*)MB · ")
-            if number_str then
-                book.size = number_str .. "MB"
-            end
-
-            print(book.download)
-
-            table.insert(book_lst, book)
-            book_count = book_count + 1
-            
-            ::continue::
-        end
-
-        print("found " .. book_count .. " entries")
+        local book_lst, book_count = parse_annas_results(data, annas_url)
 
         if book_count == 0 and zero_result_retries < MAX_ZERO_RESULT_RETRIES then
             zero_result_retries = zero_result_retries + 1
+
+            -- A challenge page we don't recognize (no known marker, no
+            -- recognizable HTTP error) parses to zero entries, which is too
+            -- late for check_url to notice - so give FlareSolverr one go at
+            -- this exact URL before spending the attempt on a different
+            -- mirror. Skipped in "always" mode, where check_url has already
+            -- put this URL through the solver and a second identical request
+            -- would only cost the user another wait.
+            if FlareSolverr and FlareSolverr.getMode() ~= FlareSolverr.MODE_ALWAYS then
+                local solved_status, solved_data = fetch_with_flaresolverr(url)
+                if solved_status == "success" and solved_data and solved_data ~= data then
+                    local solved_books, solved_count = parse_annas_results(solved_data, annas_url)
+                    if solved_count > 0 then
+                        print("=== FlareSolverr recovered the results page")
+                        return give_up(solved_books)
+                    end
+                end
+            end
+
             tally_failure("blocked")
             print("=== Zero entries parsed (likely an unrecognized bot-challenge page), trying different mirror (" .. zero_result_retries .. "/" .. MAX_ZERO_RESULT_RETRIES .. ") ...")
             goto retry
@@ -919,7 +1076,16 @@ local LIBGEN_ENOUGH_MATCHES = 100
 local function fetch_libgen_page(mirror, path, page)
     local url = "https://" .. mirror .. path .. (page > 1 and ("&page=" .. page) or "")
     print("=== Trying libgen search:", url)
-    local status, data, fail_reason = check_url(url)
+    -- A libgen search page is the only thing this URL is ever supposed to
+    -- return, so anything else (Cloudflare interstitial, mirror's landing page,
+    -- gateway error) is a page worth re-requesting through FlareSolverr. This
+    -- is a much sharper test than the generic marker list, and it also covers
+    -- challenge variants that carry no recognizable marker at all.
+    local status, data, fail_reason = check_url(url, {
+        is_blocked = function(html)
+            return not (html and html:find("<title>Library Genesis", 1, true))
+        end,
+    })
     if status == "success" and data and data:find("<title>Library Genesis", 1, true) then
         return parse_libgen_results(data)
     end
@@ -1095,7 +1261,10 @@ function download_book(book, path)
                     print("Found final link:", download_link)
                     local download_url = lgli_url .. download_link
 
-                    local dl_status, dl_data = check_url(download_url)
+                    -- This is the book file itself, not a page: allow_solver is
+                    -- off because FlareSolverr hands back a JSON string, which
+                    -- would corrupt the binary.
+                    local dl_status, dl_data = check_url(download_url, { allow_solver = false })
                     print('status:\n', dl_status)
                     print(filename)
                     local save_ok, save_msg = save_file_bytes(filename, dl_data)

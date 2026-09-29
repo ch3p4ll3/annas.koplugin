@@ -26,6 +26,44 @@ The plugin was tested on KOReader installed on a Kindle Paperwhite 11th generati
 5.  Under Search Results click on the entry you are interested in.
 6.  Finally hit `Format: (tap to download)` and confirm again by tapping `Download`.
 
+## FlareSolverr (Advanced)
+<details>
+<summary>Click to reveal</summary>
+
+**If searches return no results, or "DDoS protection" errors, Anna's Archive and its mirrors may be challenging your device.** The plugin can hand those requests to a [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) service, which loads the page in a real browser, waits out the challenge, and returns the page to the plugin.
+
+FlareSolverr is **not** bundled with the plugin and **not** required. It is off until you configure it.
+
+### What you need
+
+* A machine on the same network as your e-reader (a desktop, a NAS, a server) running Docker. Running it on the e-reader itself is not practical - FlareSolverr needs Chromium, which no current e-reader has room for.
+
+```sh
+docker run -d \
+  --name flaresolverr \
+  --restart unless-stopped \
+  -p 8191:8191 \
+  ghcr.io/flaresolverr/flaresolverr:latest
+```
+
+### Configuring the plugin
+
+1.  Open `Search` -> `Anna's Archive` -> `Settings` -> `FlareSolverr`.
+2.  Tap `FlareSolverr URL` and enter the address of the service, e.g. `http://192.168.1.10:8191` (the IP of the machine running Docker). The default FlareSolverr port is `8191`; a scheme is optional.
+3.  Leave the field empty to switch FlareSolverr off again.
+4.  Tap `Test connection` to check the setup. It asks FlareSolverr for a real Anna's Archive page and tells you what came back.
+
+### When it is used
+
+`When to use FlareSolverr` has two settings:
+
+* **Automatic (only when a page is blocked)** - the default. The plugin fetches pages directly as usual, and only contacts FlareSolverr once a page comes back as a challenge or fails outright. This costs nothing when you are not being blocked.
+* **Always (every page fetch)** - every page goes through FlareSolverr. Slower and dependent on the service, but the most reliable when Anna's Archive is aggressively challenging your device.
+
+The book file itself is always downloaded directly: FlareSolverr returns pages as text, so routing the actual ebook through it would corrupt the file.
+
+</details>
+
 ## DNS Settings (Advanced)
 <details>
 <summary>Click to reveal</summary>

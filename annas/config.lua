@@ -1,5 +1,6 @@
 local util = require("util")
 local T = require("annas.gettext")
+local logger = require("logger")
 
 local Config = {}
 
@@ -10,6 +11,8 @@ Config.SETTINGS_DOWNLOAD_DIR_KEY = "annas_download_dir"
 Config.SETTINGS_TURN_OFF_WIFI_AFTER_DOWNLOAD_KEY = "annas_turn_off_wifi_after_download"
 Config.SETTINGS_LIBGEN_MAX_PAGES_KEY = "annas_libgen_max_pages"
 Config.SETTINGS_LIBGEN_TOPICS_KEY = "annas_libgen_topics"
+Config.SETTINGS_FLARESOLVERR_URL_KEY = "annas_flaresolverr_url"
+Config.SETTINGS_FLARESOLVERR_MODE_KEY = "annas_flaresolverr_mode"
 
 -- Library Genesis collections, as libgen's topics[] search parameter.
 -- No selection searches all of them (libgen's default).
@@ -28,6 +31,25 @@ Config.SUPPORTED_LIBGEN_TOPICS = {
 Config.LIBGEN_MAX_PAGES_DEFAULT = 5
 Config.LIBGEN_MAX_PAGES_MIN = 1
 Config.LIBGEN_MAX_PAGES_MAX = 20
+
+-- FlareSolverr is an optional helper service (not part of KOReader) that loads
+-- a page in a real headless browser and hands back the HTML after any
+-- Cloudflare/DDoS-Guard interstitial has been solved. It is off unless the
+-- user points the plugin at a running instance, and the URL is almost always
+-- the default because the service usually runs next to the reader (a desktop
+-- on the same network, or on the device itself).
+Config.FLARESOLVERR_DEFAULT_URL = "http://localhost:8191"
+
+-- "fallback": fetch directly as usual, and only hand the URL to FlareSolverr
+--             once a direct fetch failed or came back as a challenge page.
+-- "always":  send every page fetch through FlareSolverr first.
+Config.FLARESOLVERR_MODE_FALLBACK = "fallback"
+Config.FLARESOLVERR_MODE_ALWAYS = "always"
+
+Config.FLARESOLVERR_MODES = {
+    { name = T("Automatic (only when a page is blocked)"), value = Config.FLARESOLVERR_MODE_FALLBACK },
+    { name = T("Always (every page fetch)"), value = Config.FLARESOLVERR_MODE_ALWAYS },
+}
 
 Config.DEFAULT_DOWNLOAD_DIR_FALLBACK = G_reader_settings:readSetting("home_dir")
              or require("apps/filemanager/filemanagerutil").getDefaultDir()
@@ -163,6 +185,80 @@ end
 
 function Config.getLibgenTopics()
     return Config.getSetting(Config.SETTINGS_LIBGEN_TOPICS_KEY, {})
+end
+
+-- Turn whatever the user typed into a usable FlareSolverr base URL, or nil
+-- when the field is empty (FlareSolverr disabled). A bare "localhost:8191" or
+-- "192.168.1.5:8191" is a common thing to type, and without a scheme it would
+-- silently build a broken request URL, so default the scheme to http.
+-- Returns the normalized URL on success, or nil plus a message on a URL that
+-- can't be used.
+function Config.normalizeFlareSolverrUrl(raw_url)
+    -- a settings store can hand back anything if it was hand-edited or
+    -- corrupted, and string methods on a non-string would raise here
+    local url = type(raw_url) == "string" and util.trim(raw_url) or ""
+    if url == "" then
+        return nil
+    end
+    if not url:match("^%a[%w+.-]*://") then
+        url = "http://" .. url
+    end
+
+    local scheme, rest = url:match("^(%a[%w+.-]*)://(.+)$")
+    if not scheme or rest == "" then
+        return nil, string.format(T("Not a valid FlareSolverr URL: %s"), url)
+    end
+    scheme = scheme:lower()
+    if scheme ~= "http" and scheme ~= "https" then
+        return nil, T("FlareSolverr URL must start with http:// or https://")
+    end
+
+    -- strip a trailing slash so callers can append "/v1" unconditionally
+    url = (scheme .. "://" .. rest):gsub("/+$", "")
+    if not url:match("^%a[%w+.-]*://[^/%s]+$") then
+        return nil, string.format(T("Not a valid FlareSolverr URL: %s"), url)
+    end
+    return url
+end
+
+function Config.getFlareSolverrUrl()
+    local url, err = Config.normalizeFlareSolverrUrl(Config.getSetting(Config.SETTINGS_FLARESOLVERR_URL_KEY, ""))
+    if not url and err then
+        logger.warn("Annas: ignoring unusable FlareSolverr URL setting: " .. tostring(err))
+    end
+    return url
+end
+
+-- An empty field disables FlareSolverr (the setting is removed rather than
+-- stored as "", so a stale URL can never resurface on its own).
+function Config.setFlareSolverrUrl(raw_url)
+    local url, err = Config.normalizeFlareSolverrUrl(raw_url)
+    if err then
+        return false, err
+    end
+    if not url then
+        Config.deleteSetting(Config.SETTINGS_FLARESOLVERR_URL_KEY)
+        return true
+    end
+    Config.saveSetting(Config.SETTINGS_FLARESOLVERR_URL_KEY, url)
+    return true
+end
+
+function Config.getFlareSolverrMode()
+    local mode = Config.getSetting(Config.SETTINGS_FLARESOLVERR_MODE_KEY, Config.FLARESOLVERR_MODE_FALLBACK)
+    if mode ~= Config.FLARESOLVERR_MODE_FALLBACK and mode ~= Config.FLARESOLVERR_MODE_ALWAYS then
+        return Config.FLARESOLVERR_MODE_FALLBACK
+    end
+    return mode
+end
+
+function Config.getFlareSolverrModeName()
+    for _, mode_info in ipairs(Config.FLARESOLVERR_MODES) do
+        if mode_info.value == Config.getFlareSolverrMode() then
+            return mode_info.name
+        end
+    end
+    return Config.FLARESOLVERR_MODES[1].name
 end
 
 -- Pre-rename versions stored these under zlibrary_* keys, which collided with

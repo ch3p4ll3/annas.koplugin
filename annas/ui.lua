@@ -11,6 +11,7 @@ local util = require("util")
 local logger = require("logger")
 local Config = require("annas.config")
 local Ota = require("annas.ota")
+local AsyncHelper = require("annas.async_helper")
 local Ui = {}
 
 local _plugin_instance = nil
@@ -156,6 +157,14 @@ function Ui.showSettingsDialog()
                 Ui.showLibgenTopicsDialog()
             end,
             }},{{
+            text = Config.getFlareSolverrUrl()
+                and string.format(T("FlareSolverr: %s"), Config.getFlareSolverrModeName())
+                or T("FlareSolverr: off"),
+            callback = function()
+                _closeAndUntrackDialog(dialog)
+                Ui.showFlareSolverrDialog()
+            end,
+            }},{{
             text = T("Check for Updates"),
             keep_menu_open = false,
             separator = true,
@@ -298,6 +307,123 @@ end
 
 function Ui.showOrdersSelectionDialog(parent_ui, ok_callback)
     _showRadioSelectionDialog(parent_ui, T("Select search order"), Config.SETTINGS_SEARCH_ORDERS_KEY, Config.SUPPORTED_ORDERS, ok_callback)
+end
+
+-- FlareSolverr is an external helper service, so its settings are behind their
+-- own dialog rather than one more entry in the main settings list. The URL
+-- field doubles as the on/off switch: empty means "don't use FlareSolverr".
+function Ui.showFlareSolverrDialog(parent_ui)
+    local url = Config.getFlareSolverrUrl()
+
+    local dialog
+    dialog = ButtonDialog:new{
+        title = T("FlareSolverr"),
+        buttons = {
+            {{
+            text = url and string.format(T("FlareSolverr URL: %s"), url) or T("FlareSolverr URL: not set"),
+            callback = function()
+                _closeAndUntrackDialog(dialog)
+                Ui.showFlareSolverrUrlDialog()
+            end,
+            }},{{
+            text = url and string.format(T("Use FlareSolverr: %s"), Config.getFlareSolverrModeName())
+                or T("Use FlareSolverr: not available"),
+            callback = function()
+                _closeAndUntrackDialog(dialog)
+                _showRadioSelectionDialog(parent_ui, T("When to use FlareSolverr"),
+                    Config.SETTINGS_FLARESOLVERR_MODE_KEY, Config.FLARESOLVERR_MODES, function()
+                        Ui.showFlareSolverrDialog()
+                    end)
+            end,
+            }},{{
+            text = T("Test connection"),
+            callback = function()
+                _closeAndUntrackDialog(dialog)
+                Ui.showFlareSolverrTestDialog()
+            end,
+            }},{{
+            text = T("Close"),
+            id = "close",
+            callback = function() _closeAndUntrackDialog(dialog) end,
+            }}
+        }
+    }
+    _showAndTrackDialog(dialog)
+end
+
+function Ui.showFlareSolverrUrlDialog()
+    local dialog
+    dialog = InputDialog:new{
+        title = T("FlareSolverr URL"),
+        input = Config.getSetting(Config.SETTINGS_FLARESOLVERR_URL_KEY, ""),
+        input_hint = T("Address of a running FlareSolverr service, e.g. http://localhost:8191 - clear the field to switch FlareSolverr off again"),
+        buttons = {{{
+        text = T("Save"),
+        is_enter_default = true,
+        callback = function()
+            local raw_url = dialog:getInputText()
+            _closeAndUntrackDialog(dialog)
+            local saved, err = Config.setFlareSolverrUrl(raw_url)
+            if not saved then
+                Ui.showErrorMessage(err)
+                Ui.showFlareSolverrDialog()
+                return
+            end
+            local url = Config.getFlareSolverrUrl()
+            if url then
+                Ui.showInfoMessage(string.format(T("FlareSolverr set to: %s"), url))
+            else
+                Ui.showInfoMessage(T("FlareSolverr disabled."))
+            end
+            Ui.showFlareSolverrDialog()
+        end,
+        }},{{
+            text = T("Cancel"),
+            id = "close",
+            callback = function() _closeAndUntrackDialog(dialog) end,
+        }}}
+    }
+    _showAndTrackDialog(dialog)
+    dialog:onShowKeyboard()
+end
+
+-- Ask FlareSolverr for a real Anna's Archive page and report what came back.
+-- Whether the service is up, whether the URL is right and whether the browser
+-- can actually clear the challenge are three different failure modes, and
+-- without a test the user has no way of telling them apart on a device.
+function Ui.showFlareSolverrTestDialog()
+    if not Config.getFlareSolverrUrl() then
+        Ui.showErrorMessage(T("Set a FlareSolverr URL first."))
+        Ui.showFlareSolverrDialog()
+        return
+    end
+
+    local FlareSolverr = require("annas.flaresolverr")
+    local probe_url
+    local loading_msg = Ui.showLoadingMessage(T("Contacting FlareSolverr ..."))
+
+    AsyncHelper.run(function()
+        -- picking a mirror can itself mean fetching the mirror list, so it has
+        -- to happen off the UI thread like the request
+        probe_url = require("src.scraper").get_annas_archive_probe_url()
+        return FlareSolverr.fetch(probe_url)
+    end,
+    function(result)
+        result = result or {}
+        local solver_status, solver_data = result[1], result[2]
+        if solver_status == "success" and solver_data then
+            Ui.showInfoMessage(string.format(T("FlareSolverr returned %d bytes for %s."), #solver_data, probe_url))
+        else
+            Ui.showErrorMessage(string.format(T("FlareSolverr could not load %s: %s"),
+                probe_url, tostring(result[3] or T("unknown error"))))
+        end
+        Ui.showFlareSolverrDialog()
+    end,
+    function(err)
+        Ui.showErrorMessage(string.format(T("FlareSolverr request failed: %s"), tostring(err)))
+        Ui.showFlareSolverrDialog()
+    end,
+    loading_msg)
 end
 
 function Ui.showSearchDialog(parent_annas, def_input)
