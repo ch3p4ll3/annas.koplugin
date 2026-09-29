@@ -403,10 +403,15 @@ function Ui.showFlareSolverrTestDialog()
     local loading_msg = Ui.showLoadingMessage(T("Contacting FlareSolverr ..."))
 
     AsyncHelper.run(function()
+        -- src/scraper.lua returns nothing and defines its functions as globals,
+        -- so require() only makes sure it is loaded; main.lua does the same.
+        require("src.scraper")
         -- picking a mirror can itself mean fetching the mirror list, so it has
         -- to happen off the UI thread like the request
-        probe_url = require("src.scraper").get_annas_archive_probe_url()
-        return FlareSolverr.fetch(probe_url)
+        probe_url = get_annas_archive_probe_url()
+        -- AsyncHelper keeps only the task's first return value, so the
+        -- (status, html, reason) tuple has to be packed into a single table
+        return { FlareSolverr.fetch(probe_url) }
     end,
     function(result)
         result = result or {}

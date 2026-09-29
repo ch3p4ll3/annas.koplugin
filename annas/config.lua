@@ -244,8 +244,13 @@ function Config.setFlareSolverrUrl(raw_url)
     return true
 end
 
+-- The shared radio dialog (Ui._showMultiSelectionDialog) always stores a
+-- one-element array, the same shape as the search order setting, so the first
+-- entry is the selected mode. A bare string is accepted too, so a value written
+-- by hand still works.
 function Config.getFlareSolverrMode()
-    local mode = Config.getSetting(Config.SETTINGS_FLARESOLVERR_MODE_KEY, Config.FLARESOLVERR_MODE_FALLBACK)
+    local stored = Config.getSetting(Config.SETTINGS_FLARESOLVERR_MODE_KEY, nil)
+    local mode = type(stored) == "table" and stored[1] or stored
     if mode ~= Config.FLARESOLVERR_MODE_FALLBACK and mode ~= Config.FLARESOLVERR_MODE_ALWAYS then
         return Config.FLARESOLVERR_MODE_FALLBACK
     end

@@ -156,6 +156,7 @@ function FlareSolverr.fetch(url, max_timeout_ms)
     end
 
     print("=== FlareSolverr: requesting", url, "from", endpoint)
+    logger.info("Annas: FlareSolverr POST " .. endpoint .. " url=" .. url)
     local raw, transport_error = post_json(endpoint, body,
         math.floor(max_timeout_ms / 1000) + CLIENT_TIMEOUT_GRACE_SECS)
     if not raw then

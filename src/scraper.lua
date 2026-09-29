@@ -6,6 +6,12 @@ local Api_ok, Api = pcall(require, "annas.api")
 if not Api_ok then Api = nil end
 local FlareSolverr_ok, FlareSolverr = pcall(require, "annas.flaresolverr")
 if not FlareSolverr_ok then FlareSolverr = nil end
+-- logger is a KOReader-only module too. Fall back to a no-op rather than
+-- guarding every call site, so the standalone mode stays usable.
+local logger_ok, logger = pcall(require, "logger")
+if not logger_ok then
+    logger = { info = function() end, warn = function() end, dbg = function() end, err = function() end }
+end
 
 -- Cache configuration
 local CACHE_FILE = "annas_domains_cache.txt"
@@ -391,27 +397,79 @@ end
 -- An anti-bot interstitial is usually served as a perfectly ordinary HTTP 200,
 -- so a fetch that "succeeded" tells us nothing on its own about whether the
 -- body is real content. These are the markers the pages we hit actually carry:
--- Anna's Archive sits behind DDoS-Guard, libgen and Wikipedia's mirrors can
--- sit behind Cloudflare. check_url() uses this to decide a body is a challenge
--- worth re-requesting through FlareSolverr.
-local CHALLENGE_MARKERS = {
-    "DDoS-Guard",
-    "/.well-known/ddos-guard/",
-    "Just a moment...",
-    "Checking your browser before accessing",
-    "cf-browser-verification",
+-- Anna's Archive sits behind DDoS-Guard, libgen and Wikipedia can sit behind
+-- Cloudflare. check_url() uses this to decide a body is a challenge worth
+-- re-requesting through FlareSolverr.
+--
+-- Matching has to be structural, not lexical. A bare "DDoS-Guard" or "Just a
+-- moment..." search anywhere in the document fires on ordinary articles: the
+-- Wikipedia page for Anna's Archive links to the DDoS-Guard article, and that
+-- alone was enough to send a 533 KB page through a headless browser. So the
+-- prose-ish phrases are only trusted in <title>, and the body is matched
+-- against script paths and element ids that a challenge page injects and no
+-- article writes.
+-- Cloudflare's interstitial title is exactly "Just a moment...", so that one is
+-- matched whole rather than as a fragment: a Wikipedia article or blog post
+-- with a title that merely starts those words is not a challenge page.
+local CHALLENGE_TITLES_EXACT = {
+    "just a moment",
+    "attention required! | cloudflare",
+}
+
+-- Titles that carry a variable tail (the hostname, an error description), so
+-- these are matched as fragments.
+local CHALLENGE_TITLES = {
+    "checking your browser before accessing",
+    "access denied",
+    "enable javascript and cookies to continue",
+    "error 1015",  -- Cloudflare: rate limited
+    "error 1020",  -- Cloudflare: firewall rule
+    "ddos-guard",
+    "security check",
+}
+
+local CHALLENGE_BODY_MARKERS = {
+    "/cdn-cgi/challenge-platform/",
     "cf_chl_opt",
     "__cf_chl_",
-    "/cdn-cgi/challenge-platform/",
-    "Attention Required! | Cloudflare",
-    "Enable JavaScript and cookies to continue",
+    "cf-browser-verification",
+    "cf-please-wait",
+    'id="cf-chl-',
+    "id='cf-chl-",
+    "/.well-known/ddos-guard/",
+    "checkddos",
 }
+
+-- Interstitials are a few KB. A large document is real content by definition,
+-- and this is the net that stops a big page which merely mentions a protection
+-- vendor from being re-fetched through FlareSolverr.
+local CHALLENGE_MAX_BYTES = 200 * 1024
 
 local function looks_like_challenge(html)
     if not html or html == "" then
         return true
     end
-    for _, marker in ipairs(CHALLENGE_MARKERS) do
+    if #html > CHALLENGE_MAX_BYTES then
+        return false
+    end
+    local title = html:match("<title[^>]*>(.-)</title>")
+    if title then
+        -- a Wikipedia article appends the site name, and a "Just a Moment" page
+        -- there is an article, not a Cloudflare interstitial
+        title = title:gsub("%s*[%-%–]%s*[Ww]ikipedia%s*$", "")
+        title = title:lower():gsub("%s+", " "):gsub("^[%s%.]+", ""):gsub("[%s%.]+$", "")
+        for _, marker in ipairs(CHALLENGE_TITLES_EXACT) do
+            if title == marker then
+                return true
+            end
+        end
+        for _, marker in ipairs(CHALLENGE_TITLES) do
+            if title:find(marker, 1, true) then
+                return true
+            end
+        end
+    end
+    for _, marker in ipairs(CHALLENGE_BODY_MARKERS) do
         if html:find(marker, 1, true) then
             return true
         end
@@ -644,6 +702,19 @@ function check_url(url, options)
     local solver_tried = false
     local reason = nil
 
+    -- One line per fetch saying whether FlareSolverr is configured and in which
+    -- mode, so a "why did it not help" question is answerable from the log.
+    if not FlareSolverr then
+        logger.info("Annas: FlareSolverr module unavailable for " .. url)
+    elseif not solver_mode then
+        logger.info("Annas: FlareSolverr not configured (no URL set), using direct fetch for " .. url)
+    else
+        logger.info("Annas: FlareSolverr configured, mode=" .. tostring(solver_mode) .. ", url=" .. url)
+        if solver_mode == FlareSolverr.MODE_ALWAYS and not allow_solver then
+            logger.info("Annas: FlareSolverr bypassed for this fetch (binary data): " .. url)
+        end
+    end
+
     local function can_solve()
         return allow_solver and solver_mode ~= nil and not solver_tried
     end
@@ -651,15 +722,22 @@ function check_url(url, options)
     local function solve(note)
         solver_tried = true
         print('=== Trying FlareSolverr (' .. note .. ') for URL:', url)
+        logger.info("Annas: FlareSolverr USED (" .. note .. ") for " .. url)
         local solver_status, solver_data, solver_reason = FlareSolverr.fetch(url)
         if solver_status == "success" then
+            logger.info("Annas: FlareSolverr OK for " .. url .. " (" .. #solver_data .. " bytes)")
             return "success", solver_data
         end
+        logger.warn("Annas: FlareSolverr FAILED for " .. url .. ": " .. tostring(solver_status)
+            .. " (" .. tostring(solver_reason) .. ")")
         reason = best_reason(reason, solver_reason)
         return nil
     end
 
-    if solver_mode == FlareSolverr.MODE_ALWAYS then
+    -- "always" means every *page* fetch goes through the browser first. A
+    -- fetch explicitly marked as not solver-safe (binary book bytes) must be
+    -- skipped even in this mode, or the JSON round trip would corrupt it.
+    if allow_solver and solver_mode == FlareSolverr.MODE_ALWAYS then
         local solver_status, solver_data = solve("always mode")
         if solver_status then
             return "success", solver_data
@@ -919,6 +997,8 @@ local function annas_search(query)
                     local solved_books, solved_count = parse_annas_results(solved_data, annas_url)
                     if solved_count > 0 then
                         print("=== FlareSolverr recovered the results page")
+                        logger.info("Annas: FlareSolverr USED (empty results page) for " .. url
+                            .. " -> recovered " .. tostring(solved_count) .. " books")
                         return give_up(solved_books)
                     end
                 end
